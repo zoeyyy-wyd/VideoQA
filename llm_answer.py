@@ -1,29 +1,27 @@
 """
 LLM Answer Generation Module
 
-Multi-round approach to handle large numbers of frames:
-  Round 1: For each moment, send its frames to LLM and get a per-moment summary
-  Round 2: Combine all per-moment summaries + query → generate final answer
+Multi-round approach with sliding-window chunking:
+  Round 1: For each moment, slide a window over its frames (with overlap) to get
+           per-chunk summaries, then merge them into a per-moment summary.
+  Round 2: Combine all per-moment summaries + query → final answer.
 
-This avoids hitting token limits by splitting the work across multiple API calls.
+Sliding window preserves temporal continuity at chunk boundaries: adjacent
+windows share `overlap` frames so actions crossing the boundary are not split.
 
 Usage:
     from llm_answer import LLMAnswerer
 
-    llm = LLMAnswerer(api_key="sk-xxx", model="gpt-4o")
-    answer = llm.answer(query, moments, frame_data)
+    llm = LLMAnswerer(api_key="sk-xxx", model="gpt-4o-mini")
+    answer = llm.answer(query, moments, frame_data,
+                        max_frames_per_call=10, overlap=2)
 """
 import os
 from typing import List, Dict, Optional
 
 
 class LLMAnswerer:
-    """
-    Multi-round LLM answer generation.
-
-    Round 1: Summarize each moment independently (frames → per-moment summary)
-    Round 2: Synthesize all summaries into a final answer (summaries → answer)
-    """
+    """Multi-round LLM answer generation with sliding-window chunking."""
 
     def __init__(self, api_key=None, model="gpt-4o-mini"):
         self.model = model
@@ -37,15 +35,17 @@ class LLMAnswerer:
             except ImportError:
                 print("Warning: openai package not installed")
 
-    def answer(self, query, moments, frame_data=None, max_frames_per_call=10):
+    def answer(self, query, moments, frame_data=None,
+               max_frames_per_call=10, overlap=2):
         """
-        Generate answer using multi-round LLM calls.
+        Generate answer using multi-round LLM calls with sliding-window chunking.
 
         Args:
             query: user's question
             moments: list of {"start", "end", "score"}
             frame_data: list of {"moment", "frames", "timestamps"}
-            max_frames_per_call: max frames per LLM call (prevents token overflow)
+            max_frames_per_call: window size (frames per LLM call)
+            overlap: number of overlapping frames between adjacent windows
 
         Returns:
             answer: str
@@ -64,8 +64,8 @@ class LLMAnswerer:
             frames = item["frames"]
             timestamps = item.get("timestamps", [])
 
-            # Split frames into chunks if too many
-            chunks = self._chunk_frames(frames, timestamps, max_frames_per_call)
+            # Sliding-window split
+            chunks = self._chunk_frames(frames, timestamps, max_frames_per_call, overlap)
 
             chunk_summaries = []
             for chunk_frames, chunk_timestamps in chunks:
@@ -74,7 +74,6 @@ class LLMAnswerer:
                 )
                 chunk_summaries.append(summary)
 
-            # Combine chunk summaries for this moment
             if len(chunk_summaries) == 1:
                 moment_summary = chunk_summaries[0]
             else:
@@ -82,11 +81,9 @@ class LLMAnswerer:
                     query, m, chunk_summaries, i + 1
                 )
 
-            moment_summaries.append({
-                "moment": m,
-                "summary": moment_summary,
-            })
-            print(f"    Moment {i+1} ({m['start']:.1f}s-{m['end']:.1f}s): done")
+            moment_summaries.append({"moment": m, "summary": moment_summary})
+            print(f"    Moment {i+1} ({m['start']:.1f}s-{m['end']:.1f}s): "
+                  f"{len(chunks)} chunk(s) → done")
 
         # Round 2: Synthesize final answer
         print("  [LLM Round 2] Synthesizing final answer...")
@@ -94,24 +91,42 @@ class LLMAnswerer:
 
         return final_answer
 
-    def _chunk_frames(self, frames, timestamps, max_per_chunk):
-        """Split frames into chunks of max_per_chunk size."""
+    def _chunk_frames(self, frames, timestamps, max_per_chunk, overlap=2):
+        """
+        Split frames into sliding windows with overlap.
+
+        window_size = max_per_chunk, stride = max_per_chunk - overlap.
+        Last chunk may be shorter than max_per_chunk (truncated to remaining frames).
+
+        Example: 25 frames, window=10, overlap=2 → stride=8
+            chunk 0: frames[0:10]   (indices 0-9)
+            chunk 1: frames[8:18]   (indices 8-17, shares 2 with chunk 0)
+            chunk 2: frames[16:25]  (indices 16-24, shares 2 with chunk 1)
+        """
         if len(frames) <= max_per_chunk:
             return [(frames, timestamps)]
 
+        stride = max_per_chunk - overlap
+        if stride <= 0:
+            raise ValueError(f"overlap ({overlap}) must be < max_per_chunk ({max_per_chunk})")
+
         chunks = []
-        for i in range(0, len(frames), max_per_chunk):
+        i = 0
+        while i < len(frames):
             chunk_f = frames[i:i + max_per_chunk]
             chunk_t = timestamps[i:i + max_per_chunk] if timestamps else []
             chunks.append((chunk_f, chunk_t))
+
+            # Stop once this chunk reaches the end
+            if i + max_per_chunk >= len(frames):
+                break
+            i += stride
+
         return chunks
 
     def _summarize_moment(self, query, moment, frames, timestamps, moment_idx):
         """
-        Round 1: Summarize a single moment's frames.
-
-        Sends frames to LLM with the query context, asks for a factual
-        description of what happens in this segment.
+        Round 1: Summarize a single window's frames.
         """
         content = [{
             "type": "text",
@@ -135,15 +150,16 @@ class LLMAnswerer:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": content}],
-            max_tokens=300,
+            max_tokens=500,
             temperature=0.2,
         )
         return response.choices[0].message.content
 
     def _merge_chunk_summaries(self, query, moment, chunk_summaries, moment_idx):
         """
-        Merge multiple chunk summaries from the same moment into one summary.
-        Used when a single moment has too many frames for one API call.
+        Merge sliding-window chunk summaries from one moment into a single summary.
+        Note: adjacent chunks share `overlap` frames, so some content may be
+        described twice — the merge step deduplicates.
         """
         summaries_text = ""
         for i, s in enumerate(chunk_summaries, 1):
@@ -154,21 +170,20 @@ class LLMAnswerer:
             messages=[{
                 "role": "user",
                 "content": (
-                    f"These are descriptions of different parts of the same video segment "
+                    f"These are descriptions of overlapping windows over the same video segment "
                     f"({moment['start']:.1f}s - {moment['end']:.1f}s), relevant to the question: \"{query}\"\n\n"
+                    f"Adjacent parts share some frames, so deduplicate when content overlaps.\n\n"
                     f"{summaries_text}"
-                    f"Combine them into one concise summary of what happens in this segment."
+                    f"Combine them into one concise, chronological summary of what happens in this segment."
                 )
             }],
-            max_tokens=200,
+            max_tokens=400,
             temperature=0.2,
         )
         return response.choices[0].message.content
 
     def _synthesize_answer(self, query, moment_summaries):
-        """
-        Round 2: Combine all moment summaries into a final answer.
-        """
+        """Round 2: Combine all moment summaries into a final answer."""
         evidence_text = ""
         for i, ms in enumerate(moment_summaries, 1):
             m = ms["moment"]
@@ -205,11 +220,10 @@ class LLMAnswerer:
             max_tokens=512,
             temperature=0.3,
         )
-        print(response)
         return response.choices[0].message.content
 
     def _text_only_answer(self, query, moments):
-        """Answer without frames (text-only mode)."""
+        """Answer without frames (text-only mode, e.g. non-vision models)."""
         evidence = "Retrieved video segments:\n"
         for i, m in enumerate(moments, 1):
             evidence += f"  Segment {i}: {m['start']:.1f}s - {m['end']:.1f}s (relevance: {m['score']:.2%})\n"
@@ -232,7 +246,7 @@ class LLMAnswerer:
         return response.choices[0].message.content
 
     def _template_answer(self, query, moments):
-        """Fallback when no API is available."""
+        """Fallback when no API client is available."""
         if not moments:
             return f"No relevant moments found for: '{query}'"
         answer = f"For the query '{query}', the following relevant moments were found:\n\n"

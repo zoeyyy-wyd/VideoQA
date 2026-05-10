@@ -1,260 +1,131 @@
-Still working on it...
+\# VideoQA: Retrieval-Augmented Video Question Answering
 
 
 
-.
+A multimodal video question answering system that retrieves relevant temporal moments before LLM reasoning, producing answers with timestamp-grounded evidence.
 
-├── LICENSE
 
-├── README.md
 
-├── commands\_pipeline.txt
+\## Overview
 
-├── data
 
-│   ├── LICENSE
 
-│   ├── README.md
+Given a video and a natural language question, the system:
 
-│   ├── highlight\_test\_release.jsonl
 
-│   ├── highlight\_test\_with\_gt.jsonl
 
-│   ├── highlight\_train\_release.jsonl
+1\. Extracts \*\*CLIP\*\* (semantic) + \*\*SlowFast\*\* (motion) features per 2-second clip
 
-│   ├── highlight\_val\_release.jsonl
+2\. Runs \*\*Moment-DETR\*\* to retrieve query-relevant temporal moments
 
-│   └── subs\_train.jsonl
+3\. Densely samples frames (1 fps) from retrieved moments only
 
-├── extract\_features.py
+4\. LLM answering pipeline ----
 
-├── features
+Round 1: A sliding window of 10 frames with a 2-frame overlap runs across the frames. Each window is sent to LLM, which produces a factual description of up to 500 tokens. All chunk descriptions for a moment are then reduced into a single per-moment summary by a separate GPT call.
 
-│   ├── clip\_features
+Round 2: All per-moment summaries are combined with the original query and sent to the LLM. The output is the answer plus evidence timestamps.
 
-│   ├── clip\_sub\_features
 
-│   │   └── args.json
 
-│   ├── clip\_text\_features
+\### Use the demo
 
-│   │   └── args.json
+1. Run server.py in terminal;
+2. Open `frontend\_page.html` in a browser, set Server URL to `http://localhost:8000`, upload a video, and ask a question.
 
-│   ├── pann\_features
 
-│   └── slowfast\_features
 
-├── inference.sh
 
-├── inference\_sf.py
 
-├── model\_best\_pretrained.ckpt
+\## Configurable Parameters
 
-├── model\_final.ckpt
 
-├── moment\_detr
 
-│   ├── \_\_init\_\_.py
+| Parameter | Default | Description |
 
-│   ├── config.py
+|------|------|------|
 
-│   ├── inference.py
+| `--threshold` | 0.75 | Moment confidence cutoff |
 
-│   ├── matcher.py
+| `--fps\_sample` | 1.0 | Frames per second within each moment |
 
-│   ├── misc.py
+| `--window\_size` | 10 | Sliding-window size for LLM calls |
 
-│   ├── model.py
+| `--overlap` | 2 | Overlapping frames between adjacent windows |
 
-│   ├── position\_encoding.py
+| `--max\_total\_frames` | None | Optional global frame cap |
 
-│   ├── postprocessing\_moment\_detr.py
 
-│   ├── scripts
 
-│   │   ├── inference.sh
+\## Evaluation
 
-│   │   ├── pretrain.sh
 
-│   │   └── train.sh
 
-│   ├── span\_utils.py
+Moment retrieval on QVHighlights test split (1,542 queries):
 
-│   ├── start\_end\_dataset.py
 
-│   ├── text\_encoder.py
 
-│   └── transformer.py
+| Metric | Score |
 
-├── pipeline.py
+|------|------|
 
-├── pretrain.sh
+| R1@0.5 | 58.30 |
 
-├── requirements.txt
+| R1@0.7 | 39.43 |
 
-├── results
+| mAP@0.5 | 59.01 |
 
-│   ├── hl-video\_tef-exp-2026\_04\_25\_19\_19\_47
+| mAP@0.75 | 35.53 |
 
-│   │   ├── best\_hl\_val\_preds.jsonl
+| mAP avg (0.5–0.95) | 35.32 |
 
-│   │   ├── best\_hl\_val\_preds\_metrics.json
 
-│   │   ├── code.zip
 
-│   │   ├── eval.log.txt
+\## Acknowledgments
 
-│   │   ├── inference\_hl\_val\_None\_preds.jsonl
 
-│   │   ├── inference\_hl\_val\_None\_preds\_metrics.json
 
-│   │   ├── latest\_hl\_val\_preds.jsonl
+This project builds on the following prior work:
 
-│   │   ├── latest\_hl\_val\_preds\_metrics.json
 
-│   │   ├── model\_best.ckpt
 
-│   │   ├── model\_e0049.ckpt
+\- \*\*Moment-DETR\*\* and \*\*QVHighlights\*\* dataset:
 
-│   │   ├── model\_e0099.ckpt
+&#x20; Jie Lei, Tamara L. Berg, and Mohit Bansal. \*Detecting Moments and Highlights in Videos via Natural Language Queries.\* NeurIPS 2021.
 
-│   │   ├── model\_e0149.ckpt
+&#x20; \[\[paper]](https://arxiv.org/abs/2107.09609) \[\[code]](https://github.com/jayleicn/moment\_detr)
 
-│   │   ├── model\_e0199.ckpt
 
-│   │   ├── model\_latest.ckpt
 
-│   │   ├── opt.json
+\- \*\*CLIP\*\* for semantic visual features:
 
-│   │   ├── tensorboard\_log
+&#x20; Alec Radford et al. \*Learning Transferable Visual Models From Natural Language Supervision.\* ICML 2021.
 
-│   │   │   └── events.out.tfevents.1777144789.moment.31958.0
+&#x20; \[\[paper]](https://arxiv.org/abs/2103.00020)
 
-│   │   └── train.log.txt
 
-│   └── hl-video\_tef-pt-2026\_04\_25\_08\_22\_54
 
-│       ├── best\_hl\_val\_preds.jsonl
+\- \*\*SlowFast\*\* for motion features:
 
-│       ├── best\_hl\_val\_preds\_metrics.json
+&#x20; Christoph Feichtenhofer, Haoqi Fan, Jitendra Malik, Kaiming He. \*SlowFast Networks for Video Recognition.\* ICCV 2019.
 
-│       ├── code.zip
+&#x20; \[\[paper]](https://arxiv.org/abs/1812.03982)
 
-│       ├── eval.log.txt
 
-│       ├── latest\_hl\_val\_preds.jsonl
 
-│       ├── latest\_hl\_val\_preds\_metrics.json
+\- \*\*DETR\*\* (architectural foundation of Moment-DETR):
 
-│       ├── model\_best.ckpt
+&#x20; Nicolas Carion et al. \*End-to-End Object Detection with Transformers.\* ECCV 2020.
 
-│       ├── model\_e0009.ckpt
+&#x20; \[\[paper]](https://arxiv.org/abs/2005.12872)
 
-│       ├── model\_e0019.ckpt
 
-│       ├── model\_e0029.ckpt
 
-│       ├── model\_e0039.ckpt
 
-│       ├── model\_e0049.ckpt
 
-│       ├── model\_e0059.ckpt
+\## License
 
-│       ├── model\_e0069.ckpt
 
-│       ├── model\_e0079.ckpt
 
-│       ├── model\_e0089.ckpt
-
-│       ├── model\_e0099.ckpt
-
-│       ├── model\_latest.ckpt
-
-│       ├── opt.json
-
-│       ├── tensorboard\_log
-
-│       │   └── events.out.tfevents.1777105377.moment.10840.0
-
-│       └── train.log.txt
-
-├── run.py
-
-├── run\_on\_video
-
-│   ├── clip
-
-│   │   ├── \_\_init\_\_.py
-
-│   │   ├── bpe\_simple\_vocab\_16e6.txt.gz
-
-│   │   ├── clip.py
-
-│   │   ├── model.py
-
-│   │   └── simple\_tokenizer.py
-
-│   ├── data\_utils.py
-
-│   ├── example
-
-│   │   ├── RoripwjYFp8\_60.0\_210.0.mp4
-
-│   │   └── queries.jsonl
-
-│   ├── model\_utils.py
-
-│   └── moment\_detr\_ckpt
-
-│       ├── README.md
-
-│       ├── eval.log.txt
-
-│       ├── inference\_hl\_val\_test\_code\_preds.jsonl
-
-│       ├── inference\_hl\_val\_test\_code\_preds\_metrics.json
-
-│       ├── model\_best.ckpt
-
-│       ├── opt.json
-
-│       └── train.log.txt
-
-├── standalone\_eval
-
-│   ├── README.md
-
-│   ├── eval.py
-
-│   ├── eval\_sample.sh
-
-│   ├── sample\_val\_preds.jsonl
-
-│   ├── sample\_val\_preds\_metrics\_raw.json
-
-│   └── utils.py
-
-├── train.py
-
-├── train.sh
-
-├── utils
-
-│   ├── basic\_utils.py
-
-│   ├── model\_utils.py
-
-│   ├── temporal\_nms.py
-
-│   ├── tensor\_utils.py
-
-│   └── windows\_utils.py
-
-└── video
-
-&#x20;   └── video.mp4
-
-
-
-21 directories, 104 files
+For academic use only. Refer to the licenses of the upstream projects (Moment-DETR, CLIP, SlowFast) for their respective terms.
 

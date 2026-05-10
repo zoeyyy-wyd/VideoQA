@@ -3,9 +3,10 @@ Video QA Pipeline: Raw Video → Feature Extraction → Moment Retrieval → LLM
 
 End-to-end pipeline:
   Stage 1: Feature Extraction - raw video → CLIP + SlowFast features
-  Stage 2: Moment Retrieval   - features + query → top-k relevant moments
-  Stage 3: Frame Extraction   - raw video + moments → dense sequential frames
+  Stage 2: Moment Retrieval   - features + query → moments above confidence threshold
+  Stage 3: Frame Extraction   - raw video + moments → dense sequential frames (1 fps, no cap)
   Stage 4: Answer Generation  - query + moments + sequential frames → natural language answer
+                                (sliding window with overlap)
 
 Usage:
     # Basic (template answer, no API key needed)
@@ -42,7 +43,7 @@ from llm_answer import LLMAnswerer
 
 
 # ============================================================
-# Stage 1: Feature Extraction (raw video → CLIP + SlowFast)
+# Stage 1: Feature Extraction
 # ============================================================
 
 class FeatureExtractor:
@@ -60,13 +61,6 @@ class FeatureExtractor:
                 print(f"  Warning: SlowFast not available ({e}), using CLIP only")
 
     def extract(self, video_path, clip_length=2):
-        """
-        Extract features from a raw video.
-
-        Returns:
-            video_feat: [num_clips, feat_dim] (2816 if CLIP+SF, 512 if CLIP only)
-            duration: video duration in seconds
-        """
         clip_feat, num_clips, duration = self.clip_extractor.extract(video_path, clip_length)
 
         if self.sf_extractor is not None:
@@ -79,16 +73,14 @@ class FeatureExtractor:
         return video_feat, duration
 
     def extract_text(self, query):
-        """Encode a text query with CLIP. Returns [1, 512]."""
         return self.clip_extractor.extract_text_features(query)
 
 
 # ============================================================
-# Stage 2: Moment Retrieval (Moment-DETR)
+# Stage 2: Moment Retrieval
 # ============================================================
 
 def build_model_inputs(video_feat, text_feat, device="cuda"):
-    """Build Moment-DETR model inputs with TEF."""
     num_clips = video_feat.shape[0]
 
     tef_start = np.arange(0, num_clips, 1.0) / num_clips
@@ -105,31 +97,21 @@ def build_model_inputs(video_feat, text_feat, device="cuda"):
 
 
 def merge_overlapping_moments(moments):
-    """
-    Merge overlapping or adjacent moments into non-overlapping segments.
-
-    Example:
-        Input:  [10-25, 15-30, 68-75]
-        Output: [10-30 (best score of merged), 68-75]
-    """
+    """Merge overlapping or adjacent (within 2s) moments, keeping the higher score."""
     if len(moments) <= 1:
         return moments
 
-    # Sort by start time
     sorted_moments = sorted(moments, key=lambda m: m["start"])
 
     merged = [sorted_moments[0].copy()]
     for m in sorted_moments[1:]:
         last = merged[-1]
-        # Overlap or adjacent (within 2 seconds gap)
-        if m["start"] <= last["end"] + 2.0:
-            # Extend end, keep the higher score
+        if m["start"] <= last["end"] + 1.0:
             last["end"] = max(last["end"], m["end"])
             last["score"] = max(last["score"], m["score"])
         else:
             merged.append(m.copy())
 
-    # Re-sort by score
     merged.sort(key=lambda x: x["score"], reverse=True)
     return merged
 
@@ -137,13 +119,13 @@ def merge_overlapping_moments(moments):
 def retrieve_moments(model, video_feat, text_feat, clip_length=2, device="cuda",
                      threshold=0.75, max_moments=10):
     """
-    Run Moment-DETR to retrieve relevant video moments.
+    Run Moment-DETR and return moments passing the confidence threshold.
 
     Pipeline:
-      1. Get raw predictions
-      2. Filter by confidence threshold
+      1. Get raw predictions from Moment-DETR
+      2. Filter by confidence threshold (fallback to best if none pass)
       3. Merge overlapping moments
-      4. Cap at max_moments
+      4. Cap at max_moments as a safety limit
     """
     model.eval()
     model_inputs, num_clips = build_model_inputs(video_feat, text_feat, device)
@@ -168,30 +150,32 @@ def retrieve_moments(model, video_feat, text_feat, clip_length=2, device="cuda",
 
     moments.sort(key=lambda x: x["score"], reverse=True)
 
-    # Filter by threshold
     filtered = [m for m in moments if m["score"] >= threshold]
 
-    # Fallback: if nothing passes threshold, return the best one
     if not filtered and moments:
-        filtered = [moments[0]]
-        print(f"  Warning: no moment above threshold {threshold}, using best match (score: {moments[0]['score']:.4f})")
+        if moments[0]["score"] >= 0.5:
+            filtered = [moments[0]]
+            print(f"  Warning: no moment above threshold {threshold}, using best match (score: {moments[0]['score']:.4f})")
+        else:
+            print(f"  No confident match (best score: {moments[0]['score']:.2f})")
 
-    # Merge overlapping moments
     filtered = merge_overlapping_moments(filtered)
     print(f"  After merging overlaps: {len(filtered)} moments")
 
-    # Cap at max_moments
     filtered = filtered[:max_moments]
 
     saliency = []
     if "saliency_scores" in outputs:
         saliency = outputs["saliency_scores"][0].cpu().numpy().tolist()
 
+    print(f"  Raw predictions:")
+    for m in moments[:10]:
+        print(f"    {m['start']:.1f}s-{m['end']:.1f}s ({m['end']-m['start']:.1f}s wide, score {m['score']:.3f})")
+
     return filtered, saliency
 
 
 def load_moment_detr(ckpt_path, device="cuda"):
-    """Load trained Moment-DETR from checkpoint."""
     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     opt = checkpoint["opt"]
     opt.device = torch.device(device)
@@ -204,29 +188,25 @@ def load_moment_detr(ckpt_path, device="cuda"):
 
 
 # ============================================================
-# Stage 3: Dense Frame Extraction (preserves temporal continuity)
+# Stage 3: Dense Frame Extraction (1 fps, no total cap by default)
 # ============================================================
 
-def extract_moment_frames(video_path, moments, fps_sample=2, max_total_frames=50):
+def extract_moment_frames(video_path, moments, fps_sample=1, max_total_frames=None):
     """
     Extract dense frames from retrieved moments to preserve temporal continuity.
 
-    Instead of picking 2 random keyframes per moment, this samples frames
-    at a fixed rate (default 2 fps) across each moment, so the LLM can
-    see the continuous action.
+    Sampling: np.linspace within each moment, with n_frames = max(3, duration * fps_sample).
+    Note: linspace gives uniform distribution across the moment (avg ~1 fps when fps_sample=1),
+    not strict integer-second sampling, but guarantees moment boundaries are covered.
 
     Args:
         video_path: path to video file
         moments: list of {"start", "end", "score"} from Stage 2
-        fps_sample: frames per second to sample within each moment (default 2)
-        max_total_frames: cap on total frames sent to LLM (controls API cost)
+        fps_sample: target frames per second within each moment (default 1)
+        max_total_frames: optional total cap. None = no limit (default).
 
     Returns:
-        list of {
-            "moment": dict,
-            "frames": [base64_str, ...],
-            "timestamps": [float, ...]   # timestamp of each frame
-        }
+        list of {"moment", "frames", "timestamps"}
     """
     try:
         import cv2
@@ -240,29 +220,20 @@ def extract_moment_frames(video_path, moments, fps_sample=2, max_total_frames=50
     video_fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Budget: distribute frames across moments proportional to duration
-    total_moment_duration = sum(m["end"] - m["start"] for m in moments)
-    if total_moment_duration <= 0:
-        cap.release()
-        return None
-
     results = []
-    frames_remaining = max_total_frames
-
-    # Cap per moment: ensure each moment gets a fair share
-    max_per_moment = max(5, max_total_frames // max(len(moments), 1))
+    frames_used = 0
 
     for moment in moments:
-        if frames_remaining <= 0:
+        if max_total_frames is not None and frames_used >= max_total_frames:
             break
 
         duration = moment["end"] - moment["start"]
-
-        # Frames for this moment: proportional to duration, capped fairly
+        # Floor at 3 frames so very short moments still have minimal coverage.
         n_frames = max(3, int(duration * fps_sample))
-        n_frames = min(n_frames, frames_remaining, max_per_moment)
 
-        # Sample timestamps uniformly across the moment
+        if max_total_frames is not None:
+            n_frames = min(n_frames, max_total_frames - frames_used)
+
         timestamps = np.linspace(moment["start"], moment["end"], n_frames).tolist()
 
         frames_b64 = []
@@ -287,98 +258,10 @@ def extract_moment_frames(video_path, moments, fps_sample=2, max_total_frames=50
                 "frames": frames_b64,
                 "timestamps": valid_timestamps,
             })
-            frames_remaining -= len(frames_b64)
+            frames_used += len(frames_b64)
 
     cap.release()
     return results
-
-
-# ============================================================
-# Stage 4: LLM Answer Generation (dense frame analysis)
-# ============================================================
-
-def generate_answer(query, moments, frame_data=None, api_key=None, model_name="gpt-4o-mini"):
-    """
-    Generate answer using LLM with dense frame analysis.
-
-    Sends frames in chronological order per moment, with timestamps,
-    so the LLM can understand temporal progression and continuous actions.
-    """
-    if not api_key:
-        return _template_answer(query, moments)
-
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-    except ImportError:
-        return _template_answer(query, moments)
-
-    system_prompt = """You are a video analysis assistant. The user asks a question about a video.
-
-The system has retrieved the most relevant video segments and extracted dense sequential frames 
-from each segment. The frames are in chronological order — use them to understand what is 
-happening over time, not just in a single snapshot.
-
-Your task:
-1. Analyze the sequence of frames to understand actions, changes, and events
-2. Give a direct, continuous answer to the question in one paragraph
-3. After your answer, list the evidence on a new line starting with "Evidence:" — include the timestamp ranges that support your answer
-4. If the evidence is insufficient, honestly say so"""
-
-    evidence = "Retrieved video segments:\n"
-    for i, m in enumerate(moments, 1):
-        evidence += f"  Segment {i}: {m['start']:.1f}s - {m['end']:.1f}s (relevance: {m['score']:.2%})\n"
-
-    if frame_data and "4o" in model_name:
-        content = [{"type": "text", "text": f"Question: {query}\n\n{evidence}"}]
-
-        for item in frame_data:
-            m = item["moment"]
-            timestamps = item.get("timestamps", [])
-            n = len(item["frames"])
-
-            content.append({
-                "type": "text",
-                "text": f"\n--- Segment: {m['start']:.1f}s - {m['end']:.1f}s (relevance: {m['score']:.2%}) | {n} sequential frames ---"
-            })
-
-            # Send frames in chronological order with timestamps
-            for j, b64 in enumerate(item["frames"]):
-                t = timestamps[j] if j < len(timestamps) else m["start"]
-                content.append({
-                    "type": "text",
-                    "text": f"[t={t:.1f}s]"
-                })
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"},
-                })
-
-        content.append({
-            "type": "text",
-            "text": "\nBased on the sequential frames above, answer the question. Pay attention to how the scene changes across frames."
-        })
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}]
-    else:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Question: {query}\n\n{evidence}\nPlease answer."},
-        ]
-
-    response = client.chat.completions.create(
-        model=model_name, messages=messages, max_tokens=1024, temperature=0.3,
-    )
-    return response.choices[0].message.content
-
-
-def _template_answer(query, moments):
-    if not moments:
-        return f"No relevant moments found for: '{query}'"
-    answer = f"For the query '{query}', the following relevant moments were found:\n\n"
-    for i, m in enumerate(moments, 1):
-        answer += f"  {i}. {m['start']:.1f}s - {m['end']:.1f}s (relevance: {m['score']:.2%})\n"
-    answer += f"\nMost relevant content is at {moments[0]['start']:.1f}s - {moments[0]['end']:.1f}s."
-    return answer
 
 
 # ============================================================
@@ -386,14 +269,7 @@ def _template_answer(query, moments):
 # ============================================================
 
 class VideoQAPipeline:
-    """
-    End-to-end: raw video + query → answer.
-
-    Usage:
-        pipe = VideoQAPipeline("results/.../model_best.ckpt")
-        result = pipe.run("video.mp4", "What is the person doing?")
-        print(result["answer"])
-    """
+    """End-to-end: raw video + query → answer."""
 
     def __init__(self, ckpt_path, device="cuda", openai_key=None,
                  llm_model="gpt-4o-mini", use_slowfast=True):
@@ -413,25 +289,28 @@ class VideoQAPipeline:
 
         print("Pipeline ready!\n")
 
-    def run(self, video_path, query, threshold=0.75):
+    def run(self, video_path, query, threshold=0.8,
+            fps_sample=1, max_total_frames=None,
+            max_frames_per_call=10, overlap=2):
         """
         Run the full pipeline on a raw video.
 
         Args:
             video_path: path to video file
             query: question about the video
-            threshold: confidence threshold (0-1), only moments above this are returned
-
-        Returns:
-            dict with "query", "answer", "moments", "saliency"
+            threshold: confidence threshold (0-1) for moment filtering
+            fps_sample: target frames per second within each moment (default 1)
+            max_total_frames: optional global frame cap (default None = no limit)
+            max_frames_per_call: sliding-window size for LLM calls (default 10)
+            overlap: overlapping frames between adjacent windows (default 2)
         """
-        # Stage 1: Extract features
+        # Stage 1
         print(f"[Stage 1] Extracting features from {os.path.basename(video_path)}...")
         video_feat, duration = self.feat.extract(video_path)
         text_feat = self.feat.extract_text(query)
         print(f"  Video: {duration:.1f}s, {video_feat.shape[0]} clips, feature dim {video_feat.shape[1]}")
 
-        # Stage 2: Retrieve moments
+        # Stage 2
         print(f"[Stage 2] Retrieving moments for: '{query}'")
         moments, saliency = retrieve_moments(
             self.model, video_feat, text_feat, device=self.device, threshold=threshold
@@ -439,16 +318,25 @@ class VideoQAPipeline:
         for i, m in enumerate(moments, 1):
             print(f"  {i}. {m['start']:.1f}s - {m['end']:.1f}s (score: {m['score']:.4f})")
 
-        # Stage 3: Extract dense frames (2 fps, generous budget - LLM handles chunking)
-        print(f"[Stage 3] Extracting dense frames...")
-        frame_data = extract_moment_frames(video_path, moments, fps_sample=2, max_total_frames=80)
+        # Stage 3
+        cap_str = "no cap" if max_total_frames is None else f"cap={max_total_frames}"
+        print(f"[Stage 3] Extracting dense frames (fps_sample={fps_sample}, {cap_str})...")
+        frame_data = extract_moment_frames(
+            video_path, moments,
+            fps_sample=fps_sample,
+            max_total_frames=max_total_frames,
+        )
         if frame_data:
             n = sum(len(item["frames"]) for item in frame_data)
             print(f"  Extracted {n} sequential frames from {len(frame_data)} moments")
 
-        # Stage 4: Multi-round LLM answer generation
-        print(f"[Stage 4] Generating answer (multi-round)...")
-        answer = self.llm.answer(query, moments, frame_data, max_frames_per_call=10)
+        # Stage 4
+        print(f"[Stage 4] Generating answer (sliding window: size={max_frames_per_call}, overlap={overlap})...")
+        answer = self.llm.answer(
+            query, moments, frame_data,
+            max_frames_per_call=max_frames_per_call,
+            overlap=overlap,
+        )
 
         return {
             "query": query,
@@ -470,6 +358,11 @@ def main():
     parser.add_argument("--openai_key", default=None, help="OpenAI API key")
     parser.add_argument("--llm", default="gpt-4o-mini", help="LLM model")
     parser.add_argument("--threshold", type=float, default=0.75, help="Confidence threshold (0-1)")
+    parser.add_argument("--fps_sample", type=float, default=1.0, help="Frames per second to sample within each moment")
+    parser.add_argument("--max_total_frames", type=int, default=None,
+                        help="Optional cap on total extracted frames (default: no limit)")
+    parser.add_argument("--window_size", type=int, default=10, help="Sliding window size (frames per LLM call)")
+    parser.add_argument("--overlap", type=int, default=2, help="Frames overlapping between adjacent windows")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no_slowfast", action="store_true", help="Skip SlowFast, use CLIP only")
     parser.add_argument("--interactive", action="store_true")
@@ -481,6 +374,14 @@ def main():
         openai_key=args.openai_key,
         llm_model=args.llm,
         use_slowfast=not args.no_slowfast,
+    )
+
+    run_kwargs = dict(
+        threshold=args.threshold,
+        fps_sample=args.fps_sample,
+        max_total_frames=args.max_total_frames,
+        max_frames_per_call=args.window_size,
+        overlap=args.overlap,
     )
 
     if args.interactive:
@@ -508,7 +409,7 @@ def main():
                 continue
 
             try:
-                result = pipe.run(video_path, query, threshold=args.threshold)
+                result = pipe.run(video_path, query, **run_kwargs)
                 print(f"\n{'='*50}")
                 print(f"Answer:\n{result['answer']}")
                 print(f"{'='*50}")
@@ -520,7 +421,7 @@ def main():
             print("\nError: --video and --query are required")
             return
 
-        result = pipe.run(args.video, args.query, threshold=args.threshold)
+        result = pipe.run(args.video, args.query, **run_kwargs)
 
         print(f"\n{'='*50}")
         print(f"Question: {result['query']}")

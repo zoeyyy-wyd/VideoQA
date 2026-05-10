@@ -15,6 +15,9 @@ Given a video and a natural language question, the system:
 
    **Round 2:** All per-moment summaries are combined with the original query and sent to the LLM. The output is the answer plus evidence timestamps.
 
+### Dataset Download
+https://www.kaggle.com/datasets/kanzallahhoussam/qvhighlight
+
 ### Use the demo
 
 1. Run `server.py` in terminal

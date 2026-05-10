@@ -8,7 +8,7 @@ Given a video and a natural language question, the system:
 
 1. Extracts **CLIP** (semantic) + **SlowFast** (motion) features per 2-second clip
 2. Runs **Moment-DETR** to retrieve query-relevant temporal moments
-3. Densely samples frames (1 fps) from retrieved moments only
+3. Densely samples frames (2 fps) from retrieved moments only
 4. **LLM answering pipeline:**
 
    **Round 1:** A sliding window of 10 frames with a 2-frame overlap runs across the frames. Each window is sent to the LLM, which produces a factual description of up to 500 tokens. All window descriptions for a moment are then reduced into a single per-moment summary by a separate GPT call.

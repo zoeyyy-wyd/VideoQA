@@ -28,7 +28,7 @@ https://www.kaggle.com/datasets/kanzallahhoussam/qvhighlight
 | Parameter | Default | Description |
 |------|------|------|
 | `--threshold` | 0.75 | Moment confidence cutoff |
-| `--fps_sample` | 1.0 | Frames per second within each moment |
+| `--fps_sample` | 2.0 | Frames per second within each moment |
 | `--window_size` | 10 | Sliding-window size for LLM calls |
 | `--overlap` | 2 | Overlapping frames between adjacent windows |
 | `--max_total_frames` | None | Optional global frame cap |
